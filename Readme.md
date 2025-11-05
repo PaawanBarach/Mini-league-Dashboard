@@ -19,7 +19,3 @@ Simple Streamlit app to:
 - DEFAULT_LEAGUE_ID in app.py (sidebar form only updates it on Submit)
 - GW overrides in sidebar: choose Gameweek, select None/Skip/Eject, optional note, Save
 
-## Deploy (Streamlit Community Cloud)
-- Connect GitHub account
-- Create app: pick repo, branch, and app.py as entrypoint
-- Optional: set Python version and paste secrets if using external DB
