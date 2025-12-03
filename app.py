@@ -1,6 +1,5 @@
-# app.py
 import time
-import sqlite3
+import psycopg2
 import requests
 import pandas as pd
 import streamlit as st
@@ -14,70 +13,94 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FPL-Forfeits/1.3)"}
 # Set your default league here. It only changes when you submit the form.
 DEFAULT_LEAGUE_ID = 1415574 
 
-# ------------- Persistence (SQLite) -------------
-@st.cache_resource
+# ------------- Persistence (Postgres/Neon) -------------
+# Note: We do not cache the connection resource because cloud connections can time out.
 def get_db():
-    conn = sqlite3.connect("forfeits.db", check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS forfeits (
-            league_id INTEGER NOT NULL,
-            entry     INTEGER NOT NULL,
-            forfeits  TEXT,
-            PRIMARY KEY (league_id, entry)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS overrides (
-            league_id INTEGER NOT NULL,
-            event     INTEGER NOT NULL,
-            action    TEXT NOT NULL CHECK(action IN ('none','skip','eject')),
-            note      TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (league_id, event)
-        )
-    """)
+    # Ensure you have set [postgres] url="..." in your Streamlit secrets
+    try:
+        conn = psycopg2.connect(st.secrets["postgres"]["url"])
+    except Exception as e:
+        st.error("Could not connect to database. Make sure 'postgres.url' is set in secrets.")
+        st.stop()
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS forfeits (
+                league_id BIGINT NOT NULL,
+                entry     BIGINT NOT NULL,
+                forfeits  TEXT,
+                PRIMARY KEY (league_id, entry)
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS overrides (
+                league_id BIGINT NOT NULL,
+                event     INTEGER NOT NULL,
+                action    TEXT NOT NULL CHECK(action IN ('none','skip','eject')),
+                note      TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (league_id, event)
+            );
+        """)
     conn.commit()
     return conn
 
 def load_forfeits(conn, league_id: int) -> pd.DataFrame:
-    df = pd.read_sql_query(
-        "SELECT entry, forfeits FROM forfeits WHERE league_id = ?",
-        conn, params=(league_id,)
-    )
-    if df.empty:
-        df = pd.DataFrame(columns=["entry","forfeits"])
-    return df
+    try:
+        df = pd.read_sql_query(
+            "SELECT entry, forfeits FROM forfeits WHERE league_id = %s",
+            conn, params=(league_id,)
+        )
+        if df.empty:
+            df = pd.DataFrame(columns=["entry","forfeits"])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["entry","forfeits"])
 
 def save_forfeits(conn, league_id: int, df: pd.DataFrame):
     if df.empty:
         return
+    
     rows = [(int(league_id), int(r.entry), str(r.forfeits)) for r in df.itertuples(index=False)]
-    conn.executemany(
-        "INSERT OR REPLACE INTO forfeits (league_id, entry, forfeits) VALUES (?, ?, ?)",
-        rows
-    )
+    
+    with conn.cursor() as cur:
+        query = """
+            INSERT INTO forfeits (league_id, entry, forfeits) 
+            VALUES (%s, %s, %s)
+            ON CONFLICT (league_id, entry) 
+            DO UPDATE SET forfeits = EXCLUDED.forfeits
+        """
+        cur.executemany(query, rows)
     conn.commit()
 
 def load_overrides(conn, league_id: int) -> dict:
-    df = pd.read_sql_query(
-        "SELECT event, action, note FROM overrides WHERE league_id = ?",
-        conn, params=(league_id,)
-    )
-    return {int(r.event): {"action": r.action, "note": (r.note or "")}
-            for r in df.itertuples(index=False)}
+    try:
+        df = pd.read_sql_query(
+            "SELECT event, action, note FROM overrides WHERE league_id = %s",
+            conn, params=(league_id,)
+        )
+        return {int(r.event): {"action": r.action, "note": (r.note or "")}
+                for r in df.itertuples(index=False)}
+    except Exception:
+        return {}
 
 def set_override(conn, league_id: int, event: int, action: str, note: str = ""):
-    conn.execute(
-        "INSERT OR REPLACE INTO overrides (league_id, event, action, note) VALUES (?, ?, ?, ?)",
-        (league_id, event, action, note)
-    )
+    with conn.cursor() as cur:
+        query = """
+            INSERT INTO overrides (league_id, event, action, note) 
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (league_id, event) 
+            DO UPDATE SET action = EXCLUDED.action, note = EXCLUDED.note, updated_at = CURRENT_TIMESTAMP
+        """
+        cur.execute(query, (league_id, event, action, note))
     conn.commit()
 
 def clear_override(conn, league_id: int, event: int):
-    conn.execute(
-        "DELETE FROM overrides WHERE league_id = ? AND event = ?",
-        (league_id, event)
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM overrides WHERE league_id = %s AND event = %s",
+            (league_id, event)
+        )
     conn.commit()
 
 # ------------- FPL fetch (cached) -------------
